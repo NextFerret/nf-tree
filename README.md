@@ -9,4 +9,5 @@ NextFerret-Tree Is your Brand New Alternative to `ostree`,just like OpenRC is wi
 `nf-tree create (name)` creates a snapshot
 `nf-tree remove (name)` removes a snapshot
 `nf-tree start-daemon` creates a snapshot at every 3 hours
+
 ---
