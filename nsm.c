@@ -19,7 +19,6 @@
 #define DAEMON_AUTO_DIR         "/nsm/snapshots/auto/daemon"
 #define MANUAL_DIR              "/nsm/snapshots/manual"
 #define ROOT_SOURCE             "/"
-#define HOME_SOURCE             "/home"
 #define CMD_BUF                 4096
 #define STR_BUF                 512
 #define PATH_BUF                1024
@@ -84,12 +83,6 @@ static CmdResult run_cmdf(const char *fmt, ...)
     CmdResult r = run_cmdv(fmt, ap);
     va_end(ap);
     return r;
-}
-
-static void shell(const char *cmd)
-{
-    int r = system(cmd);
-    (void)r;
 }
 
 static bool ensure_dir(const char *path)
@@ -244,8 +237,7 @@ static bool create_snapshot(const char *mountpoint, const char *prefix, const ch
         printf("Error: cannot create snapshot metadata directory.\n");
         return false;
     }
-    bool is_root = (strcmp(mountpoint, "/") == 0);
-    bool frozen = !is_root && freeze_mount(mountpoint);
+    bool frozen = freeze_mount(mountpoint);
     CmdResult r;
     if (info.is_thin) {
         r = run_cmdf("lvcreate -s -n %s %s", snapname, info.lvpath);
@@ -282,55 +274,6 @@ static bool delete_snapshot_lv(const char *snapshot_lvpath)
 {
     CmdResult r = run_cmdf("lvremove -fy %s", snapshot_lvpath);
     return r.rc == 0;
-}
-
-static int path_depth(const char *p)
-{
-    int d = 0;
-    for (const char *s = p; *s; s++) if (*s == '/') d++;
-    return d;
-}
-
-static int cmp_path_desc(const void *a, const void *b)
-{
-    const char *pa = *(const char *const *)a;
-    const char *pb = *(const char *const *)b;
-    int da = path_depth(pa);
-    int db = path_depth(pb);
-    if (da != db) return db - da;
-    size_t la = strlen(pa), lb = strlen(pb);
-    if (la != lb) return (lb > la) - (lb < la);
-    return strcmp(pa, pb);
-}
-
-static bool rollback_home(const SnapshotMeta *meta)
-{
-    shell("fuser -km /home > /dev/null 2>&1");
-    sleep(1);
-    sync();
-    if (umount(HOME_SOURCE) != 0) {
-        shell("umount -l /home > /dev/null 2>&1");
-        sleep(1);
-    }
-    CmdResult ck = run_cmdf("fuser /home 2>/dev/null");
-    if (ck.rc == 0 && ck.out[0] != '\0') {
-        printf("Rollback failed: processes still hold /home open.\n");
-        shell("mount /home > /dev/null 2>&1");
-        return false;
-    }
-    sync();
-    run_cmdf("lvchange -an %s", meta->origin_lvpath);
-    CmdResult r = run_cmdf("lvconvert --merge %s", meta->snapshot_lvpath);
-    if (r.rc != 0) {
-        printf("Rollback failed: %s\n", r.out);
-        run_cmdf("lvchange -ay %s", meta->origin_lvpath);
-        shell("mount /home > /dev/null 2>&1");
-        return false;
-    }
-    run_cmdf("lvchange -ay %s", meta->origin_lvpath);
-    shell("mount /home > /dev/null 2>&1");
-    printf("SUCCESS: Home rollback complete. REBOOT may be required if the merge is pending.\n");
-    return true;
 }
 
 static bool initramfs_has_lvm_hook(void)
@@ -408,7 +351,6 @@ static bool rollback_snapshot(const char *name)
         return false;
     }
     if (strcmp(meta.kind, "root") == 0) return rollback_root(&meta);
-    if (strcmp(meta.kind, "home") == 0) return rollback_home(&meta);
     printf("Error: invalid snapshot kind.\n");
     return false;
 }
@@ -417,8 +359,8 @@ static void list_dir(const char *dir)
 {
     DIR *d = opendir(dir);
     if (!d) return;
-    char *roots[256], *homes[256];
-    int nr = 0, nh = 0;
+    char *roots[256];
+    int nr = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
@@ -427,8 +369,6 @@ static void list_dir(const char *dir)
         if (access(meta, F_OK) != 0) continue;
         if (strncmp(e->d_name, "root-", 5) == 0) {
             if (nr < 256) roots[nr++] = strdup(e->d_name);
-        } else if (strncmp(e->d_name, "home-", 5) == 0) {
-            if (nh < 256) homes[nh++] = strdup(e->d_name);
         }
     }
     closedir(d);
@@ -437,12 +377,6 @@ static void list_dir(const char *dir)
     for (int i = 0; i < nr; i++) {
         printf("    %s\n", roots[i]);
         free(roots[i]);
-    }
-    printf("  [Home]\n");
-    if (!nh) printf("    (none)\n");
-    for (int i = 0; i < nh; i++) {
-        printf("    %s\n", homes[i]);
-        free(homes[i]);
     }
 }
 
@@ -467,12 +401,98 @@ static void delete_subvol(const char *path)
     delete_snapshot_lv(path);
 }
 
+static double vgfree_percent(const char *vg)
+{
+    CmdResult r = run_cmdf(
+        "vgs --noheadings --nosuffix --units b -o vg_free_count,vg_extent_count %s", vg);
+    if (r.rc != 0) return 100.0;
+    trim(r.out);
+    unsigned long long free_ext = 0, total_ext = 0;
+    if (sscanf(r.out, "%llu %llu", &free_ext, &total_ext) != 2 || total_ext == 0)
+        return 100.0;
+    return 100.0 * (double)free_ext / (double)total_ext;
+}
+
+static char *detect_vg(void)
+{
+    CmdResult r = run_cmdf(
+        "vgs --noheadings -o vg_name vgfree 2>/dev/null");
+    if (r.rc == 0) {
+        trim(r.out);
+        if (r.out[0]) return strdup(r.out);
+    }
+    r = run_cmdf("vgs --noheadings -o vg_name 2>/dev/null | head -1");
+    trim(r.out);
+    if (r.out[0]) return strdup(r.out);
+    return NULL;
+}
+
+typedef struct {
+    char dir[PATH_BUF];
+    char name[STR_BUF];
+    char lvpath[PATH_BUF];
+    unsigned long long size_bytes;
+} SnapEntry;
+
+static int cmp_snap_size_desc(const void *a, const void *b)
+{
+    const SnapEntry *sa = (const SnapEntry *)a;
+    const SnapEntry *sb = (const SnapEntry *)b;
+    if (sb->size_bytes > sa->size_bytes) return 1;
+    if (sb->size_bytes < sa->size_bytes) return -1;
+    return 0;
+}
+
+static unsigned long long lv_size_bytes(const char *lvpath)
+{
+    CmdResult r = run_cmdf(
+        "lvs --noheadings --nosuffix --units b -o lv_size %s", lvpath);
+    if (r.rc != 0) return 0;
+    trim(r.out);
+    unsigned long long sz = 0;
+    sscanf(r.out, "%llu", &sz);
+    return sz;
+}
+
+static void collect_snapshots(const char *dir, SnapEntry *entries, int *count, int max)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && *count < max) {
+        if (e->d_name[0] == '.') continue;
+        char mpath[PATH_BUF];
+        snprintf(mpath, sizeof(mpath), "%s/%s/%s", dir, e->d_name, META_FILE);
+        if (access(mpath, F_OK) != 0) continue;
+        char snap_dir[PATH_BUF];
+        snprintf(snap_dir, sizeof(snap_dir), "%s/%s", dir, e->d_name);
+        SnapshotMeta sm;
+        if (!read_snapshot_meta(snap_dir, &sm)) continue;
+        SnapEntry *se = &entries[*count];
+        snprintf(se->dir, sizeof(se->dir), "%s", snap_dir);
+        snprintf(se->name, sizeof(se->name), "%s", e->d_name);
+        snprintf(se->lvpath, sizeof(se->lvpath), "%s", sm.snapshot_lvpath);
+        se->size_bytes = lv_size_bytes(sm.snapshot_lvpath);
+        (*count)++;
+    }
+    closedir(d);
+}
+
+static void delete_snap_entry(const SnapEntry *se)
+{
+    char mpath[PATH_BUF];
+    snprintf(mpath, sizeof(mpath), "%s/%s", se->dir, META_FILE);
+    delete_subvol(se->lvpath);
+    unlink(mpath);
+    rmdir(se->dir);
+}
+
 static void cleanup_dir(const char *dir)
 {
     DIR *d = opendir(dir);
     if (!d) return;
-    char *roots[256], *homes[256];
-    int nr = 0, nh = 0;
+    char *roots[256];
+    int nr = 0;
     struct dirent *e;
     while ((e = readdir(d))) {
         if (e->d_name[0] == '.') continue;
@@ -481,13 +501,10 @@ static void cleanup_dir(const char *dir)
         if (access(meta, F_OK) != 0) continue;
         if (strncmp(e->d_name, "root-", 5) == 0) {
             if (nr < 256) roots[nr++] = strdup(e->d_name);
-        } else if (strncmp(e->d_name, "home-", 5) == 0) {
-            if (nh < 256) homes[nh++] = strdup(e->d_name);
         }
     }
     closedir(d);
     qsort(roots, nr, sizeof(char *), cmp_str);
-    qsort(homes, nh, sizeof(char *), cmp_str);
     if (nr > 6) {
         char path[PATH_BUF], meta[PATH_BUF];
         snprintf(path, sizeof(path), "%s/%s", dir, roots[0]);
@@ -499,23 +516,36 @@ static void cleanup_dir(const char *dir)
         unlink(meta);
         rmdir(path);
     }
-    if (nh > 6) {
-        char path[PATH_BUF], meta[PATH_BUF];
-        snprintf(path, sizeof(path), "%s/%s", dir, homes[0]);
-        snprintf(meta, sizeof(meta), "%s/%s", path, META_FILE);
-        SnapshotMeta sm;
-        if (read_snapshot_meta(path, &sm)) {
-            delete_subvol(sm.snapshot_lvpath);
-        }
-        unlink(meta);
-        rmdir(path);
-    }
     for (int i = 0; i < nr; i++) free(roots[i]);
-    for (int i = 0; i < nh; i++) free(homes[i]);
+}
+
+static void cleanup_by_size(const char *vg)
+{
+    SnapEntry entries[768];
+    int count = 0;
+    collect_snapshots(AUTO_DIR,        entries, &count, 768);
+    collect_snapshots(DAEMON_AUTO_DIR, entries, &count, 768);
+    collect_snapshots(MANUAL_DIR,      entries, &count, 768);
+    if (count == 0) return;
+    qsort(entries, count, sizeof(SnapEntry), cmp_snap_size_desc);
+    for (int i = 0; i < count; i++) {
+        printf("Freeing space: deleting %s (%llu bytes)\n",
+               entries[i].name, entries[i].size_bytes);
+        delete_snap_entry(&entries[i]);
+        if (vgfree_percent(vg) >= 7.0) break;
+    }
 }
 
 static void autodel_snapshots(void)
 {
+    char *vg = detect_vg();
+    if (vg && vgfree_percent(vg) < 7.0) {
+        printf("VG free space below 7%%, deleting heaviest snapshots...\n");
+        cleanup_by_size(vg);
+        free(vg);
+        return;
+    }
+    free(vg);
     cleanup_dir(AUTO_DIR);
     cleanup_dir(DAEMON_AUTO_DIR);
     cleanup_dir(MANUAL_DIR);
