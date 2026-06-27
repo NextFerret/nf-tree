@@ -7,26 +7,27 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/mount.h>
 #include <time.h>
 #include <stdbool.h>
 #include <ctype.h>
 #include <errno.h>
-#include <stdarg.h>
+#include <sys/utsname.h>
 
 #define SNAPSHOT_BASE           "/nsm/snapshots"
 #define AUTO_DIR                "/nsm/snapshots/auto"
 #define DAEMON_AUTO_DIR         "/nsm/snapshots/auto/daemon"
 #define MANUAL_DIR              "/nsm/snapshots/manual"
 #define ROOT_SOURCE             "/"
-#define CMD_BUF                 4096
 #define STR_BUF                 512
 #define PATH_BUF                1024
 #define META_FILE               "meta"
+#define THIN_POOL_WARN_PERCENT  80.0
+#define VG_WARN_PERCENT         7.0
+#define OUT_BUF                 8192
 
 typedef struct {
     int rc;
-    char out[8192];
+    char out[OUT_BUF];
 } CmdResult;
 
 typedef struct {
@@ -34,6 +35,7 @@ typedef struct {
     char lv[STR_BUF];
     char lvpath[PATH_BUF];
     char segtype[STR_BUF];
+    char pool[STR_BUF];
     bool is_thin;
 } LvmInfo;
 
@@ -59,29 +61,41 @@ static void trim(char *s)
     if (i > 0) memmove(s, s + i, strlen(s + i) + 1);
 }
 
-static CmdResult run_cmdv(const char *fmt, va_list ap)
+static CmdResult exec_cmd(const char **argv)
 {
     CmdResult r = {-1, ""};
-    char cmd[CMD_BUF];
-    vsnprintf(cmd, sizeof(cmd), fmt, ap);
-    char full[CMD_BUF];
-    snprintf(full, sizeof(full), "%s 2>&1", cmd);
-    FILE *p = popen(full, "r");
-    if (!p) return r;
+    if (!argv || !argv[0]) return r;
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return r;
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return r;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
     char buf[256];
-    while (fgets(buf, sizeof(buf), p))
-        strncat(r.out, buf, sizeof(r.out) - strlen(r.out) - 1);
-    int st = pclose(p);
-    r.rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-    return r;
-}
-
-static CmdResult run_cmdf(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    CmdResult r = run_cmdv(fmt, ap);
-    va_end(ap);
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        size_t outlen = strlen(r.out);
+        if (outlen + (size_t)n < sizeof(r.out) - 1) {
+            memcpy(r.out + outlen, buf, n);
+            r.out[outlen + n] = '\0';
+        }
+    }
+    close(pipefd[0]);
+    int status;
+    waitpid(pid, &status, 0);
+    r.rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return r;
 }
 
@@ -103,7 +117,8 @@ static bool ensure_dir(const char *path)
 
 static bool read_mount_field(const char *target, const char *field, char *out, size_t sz)
 {
-    CmdResult r = run_cmdf("findmnt -no %s --target %s", field, target);
+    const char *argv[] = {"findmnt", "-no", field, "--target", target, NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc != 0) return false;
     trim(r.out);
     if (r.out[0] == '\0') return false;
@@ -113,19 +128,24 @@ static bool read_mount_field(const char *target, const char *field, char *out, s
 
 static bool resolve_lvm_info(const char *source, LvmInfo *info)
 {
-    CmdResult r = run_cmdf("lvs --noheadings --separator / -o vg_name,lv_name,segtype %s", source);
+    memset(info, 0, sizeof(*info));
+    const char *argv[] = {"lvs", "--noheadings", "--separator", "|", "-o",
+                          "vg_name,lv_name,segtype,pool_lv", source, NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc != 0) return false;
     trim(r.out);
     if (r.out[0] == '\0') return false;
-    char vg[STR_BUF] = "", lv[STR_BUF] = "", seg[STR_BUF] = "";
-    if (sscanf(r.out, "%511[^/]/%511[^/]/%511s", vg, lv, seg) != 3) return false;
+    char vg[STR_BUF] = "", lv[STR_BUF] = "", seg[STR_BUF] = "", pool[STR_BUF] = "";
+    if (sscanf(r.out, "%511[^|]|%511[^|]|%511[^|]|%511s", vg, lv, seg, pool) < 3) return false;
     trim(vg);
     trim(lv);
     trim(seg);
+    trim(pool);
     if (vg[0] == '\0' || lv[0] == '\0' || seg[0] == '\0') return false;
     snprintf(info->vg, sizeof(info->vg), "%s", vg);
     snprintf(info->lv, sizeof(info->lv), "%s", lv);
     snprintf(info->segtype, sizeof(info->segtype), "%s", seg);
+    snprintf(info->pool, sizeof(info->pool), "%s", pool);
     snprintf(info->lvpath, sizeof(info->lvpath), "/dev/%s/%s", vg, lv);
     info->is_thin = strstr(seg, "thin") != NULL;
     return true;
@@ -141,12 +161,14 @@ static bool snapshot_mount_fstype(const char *mountpoint)
 
 static bool freeze_mount(const char *mountpoint)
 {
-    return run_cmdf("fsfreeze -f %s", mountpoint).rc == 0;
+    const char *argv[] = {"fsfreeze", "-f", mountpoint, NULL};
+    return exec_cmd(argv).rc == 0;
 }
 
 static void unfreeze_mount(const char *mountpoint)
 {
-    run_cmdf("fsfreeze -u %s", mountpoint);
+    const char *argv[] = {"fsfreeze", "-u", mountpoint, NULL};
+    exec_cmd(argv);
 }
 
 static bool write_snapshot_meta(const char *dir, const SnapshotMeta *meta)
@@ -207,6 +229,21 @@ static void remove_snapshot_meta(const char *dir)
     rmdir(dir);
 }
 
+static bool get_thinpool_usage(const char *vg, const char *pool, double *data_pct, double *meta_pct)
+{
+    char lvpath[PATH_BUF];
+    snprintf(lvpath, sizeof(lvpath), "/dev/%s/%s", vg, pool);
+    const char *argv[] = {"lvs", "--noheadings", "--nosuffix", "-o",
+                          "data_percent,meta_percent", lvpath, NULL};
+    CmdResult r = exec_cmd(argv);
+    if (r.rc != 0) return false;
+    trim(r.out);
+    *data_pct = 0.0;
+    *meta_pct = 0.0;
+    if (sscanf(r.out, "%lf %lf", data_pct, meta_pct) != 2) return false;
+    return true;
+}
+
 static bool create_snapshot(const char *mountpoint, const char *prefix, const char *type, const char *name)
 {
     char source[PATH_BUF];
@@ -223,10 +260,19 @@ static bool create_snapshot(const char *mountpoint, const char *prefix, const ch
         printf("Error: %s is not an LVM volume or cannot be resolved.\n", mountpoint);
         return false;
     }
+    if (info.is_thin && info.pool[0] != '\0') {
+        double data_pct = 0.0, meta_pct = 0.0;
+        if (get_thinpool_usage(info.vg, info.pool, &data_pct, &meta_pct)) {
+            if (data_pct >= THIN_POOL_WARN_PERCENT || meta_pct >= THIN_POOL_WARN_PERCENT) {
+                printf("Warning: thinpool %s usage high (data: %.1f%%, meta: %.1f%%).\n", info.pool, data_pct, meta_pct);
+                printf("Snapshot may fail if pool is full.\n");
+            }
+        }
+    }
     time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
+    struct tm *tm_info = localtime(&t);
     char ts[64];
-    strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", tm_info);
     char snapname[STR_BUF];
     snprintf(snapname, sizeof(snapname), "%s-%s-%s-%s", prefix, type, name, ts);
     const char *base = strcmp(type, "auto") == 0 ? AUTO_DIR : MANUAL_DIR;
@@ -240,9 +286,11 @@ static bool create_snapshot(const char *mountpoint, const char *prefix, const ch
     bool frozen = freeze_mount(mountpoint);
     CmdResult r;
     if (info.is_thin) {
-        r = run_cmdf("lvcreate -s -n %s %s", snapname, info.lvpath);
+        const char *argv[] = {"lvcreate", "-s", "-n", snapname, info.lvpath, NULL};
+        r = exec_cmd(argv);
     } else {
-        r = run_cmdf("lvcreate -s -n %s -l 50%%ORIGIN %s", snapname, info.lvpath);
+        const char *argv[] = {"lvcreate", "-s", "-n", snapname, "-l", "50%ORIGIN", info.lvpath, NULL};
+        r = exec_cmd(argv);
     }
     if (frozen) unfreeze_mount(mountpoint);
     if (r.rc != 0) {
@@ -272,14 +320,25 @@ static bool create_snapshot(const char *mountpoint, const char *prefix, const ch
 
 static bool delete_snapshot_lv(const char *snapshot_lvpath)
 {
-    CmdResult r = run_cmdf("lvremove -fy %s", snapshot_lvpath);
-    return r.rc == 0;
+    const char *argv[] = {"lvremove", "-fy", snapshot_lvpath, NULL};
+    return exec_cmd(argv).rc == 0;
 }
 
 static bool initramfs_has_lvm_hook(void)
 {
-    CmdResult r = run_cmdf("lsinitramfs /boot/initrd.img-$(uname -r) 2>/dev/null | grep -q lvm");
-    return r.rc == 0;
+    struct utsname uts;
+    if (uname(&uts) != 0) return false;
+    char initrd[PATH_BUF];
+    snprintf(initrd, sizeof(initrd), "/boot/initrd.img-%s", uts.release);
+    const char *argv[] = {"lsinitramfs", initrd, NULL};
+    CmdResult r = exec_cmd(argv);
+    if (r.rc != 0) return false;
+    char *line = strtok(r.out, "\n");
+    while (line) {
+        if (strstr(line, "lvm") != NULL) return true;
+        line = strtok(NULL, "\n");
+    }
+    return false;
 }
 
 static bool rollback_root(const SnapshotMeta *meta)
@@ -289,7 +348,8 @@ static bool rollback_root(const SnapshotMeta *meta)
         printf("The merge is scheduled but may not apply on reboot.\n");
         printf("Run: update-initramfs -u   then reboot.\n");
     }
-    CmdResult r = run_cmdf("lvconvert --merge %s", meta->snapshot_lvpath);
+    const char *argv[] = {"lvconvert", "--merge", meta->snapshot_lvpath, NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc != 0) {
         printf("Rollback failed: %s\n", r.out);
         return false;
@@ -300,7 +360,7 @@ static bool rollback_root(const SnapshotMeta *meta)
 
 static bool find_snapshot(const char *name, char *dir_out, size_t sz)
 {
-    const char *dirs[] = { MANUAL_DIR, AUTO_DIR, DAEMON_AUTO_DIR };
+    const char *dirs[] = {MANUAL_DIR, AUTO_DIR, DAEMON_AUTO_DIR};
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         char path[PATH_BUF];
         snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
@@ -403,8 +463,9 @@ static void delete_subvol(const char *path)
 
 static double vgfree_percent(const char *vg)
 {
-    CmdResult r = run_cmdf(
-        "vgs --noheadings --nosuffix --units b -o vg_free_count,vg_extent_count %s", vg);
+    const char *argv[] = {"vgs", "--noheadings", "--nosuffix", "--units", "b",
+                          "-o", "vg_free_count,vg_extent_count", vg, NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc != 0) return 100.0;
     trim(r.out);
     unsigned long long free_ext = 0, total_ext = 0;
@@ -415,16 +476,38 @@ static double vgfree_percent(const char *vg)
 
 static char *detect_vg(void)
 {
-    CmdResult r = run_cmdf(
-        "vgs --noheadings -o vg_name vgfree 2>/dev/null");
+    const char *argv[] = {"vgs", "--noheadings", "-o", "vg_name", NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc == 0) {
         trim(r.out);
+        char *nl = strchr(r.out, '\n');
+        if (nl) *nl = '\0';
         if (r.out[0]) return strdup(r.out);
     }
-    r = run_cmdf("vgs --noheadings -o vg_name 2>/dev/null | head -1");
-    trim(r.out);
-    if (r.out[0]) return strdup(r.out);
     return NULL;
+}
+
+static bool detect_thinpool(const char *vg, char *pool_out, size_t sz)
+{
+    char vgpath[PATH_BUF];
+    snprintf(vgpath, sizeof(vgpath), "/dev/%s", vg);
+    const char *argv[] = {"lvs", "--noheadings", "-o", "lv_name,segtype", vgpath, NULL};
+    CmdResult r = exec_cmd(argv);
+    if (r.rc != 0) return false;
+    char *line = strtok(r.out, "\n");
+    while (line) {
+        char name[STR_BUF], segtype[STR_BUF];
+        if (sscanf(line, "%511s %511s", name, segtype) == 2) {
+            trim(name);
+            trim(segtype);
+            if (strcmp(segtype, "thin-pool") == 0) {
+                snprintf(pool_out, sz, "%s", name);
+                return true;
+            }
+        }
+        line = strtok(NULL, "\n");
+    }
+    return false;
 }
 
 typedef struct {
@@ -445,8 +528,8 @@ static int cmp_snap_size_desc(const void *a, const void *b)
 
 static unsigned long long lv_size_bytes(const char *lvpath)
 {
-    CmdResult r = run_cmdf(
-        "lvs --noheadings --nosuffix --units b -o lv_size %s", lvpath);
+    const char *argv[] = {"lvs", "--noheadings", "--nosuffix", "--units", "b", "-o", "lv_size", lvpath, NULL};
+    CmdResult r = exec_cmd(argv);
     if (r.rc != 0) return 0;
     trim(r.out);
     unsigned long long sz = 0;
@@ -505,7 +588,7 @@ static void cleanup_dir(const char *dir)
     }
     closedir(d);
     qsort(roots, nr, sizeof(char *), cmp_str);
-    if (nr > 6) {
+    while (nr > 6) {
         char path[PATH_BUF], meta[PATH_BUF];
         snprintf(path, sizeof(path), "%s/%s", dir, roots[0]);
         snprintf(meta, sizeof(meta), "%s/%s", path, META_FILE);
@@ -515,37 +598,64 @@ static void cleanup_dir(const char *dir)
         }
         unlink(meta);
         rmdir(path);
+        free(roots[0]);
+        memmove(roots, roots + 1, (nr - 1) * sizeof(char *));
+        nr--;
     }
     for (int i = 0; i < nr; i++) free(roots[i]);
 }
 
-static void cleanup_by_size(const char *vg)
+static void cleanup_by_size(const char *vg, const char *pool, bool is_thin)
 {
     SnapEntry entries[768];
     int count = 0;
-    collect_snapshots(AUTO_DIR,        entries, &count, 768);
+    collect_snapshots(AUTO_DIR, entries, &count, 768);
     collect_snapshots(DAEMON_AUTO_DIR, entries, &count, 768);
-    collect_snapshots(MANUAL_DIR,      entries, &count, 768);
+    collect_snapshots(MANUAL_DIR, entries, &count, 768);
     if (count == 0) return;
     qsort(entries, count, sizeof(SnapEntry), cmp_snap_size_desc);
     for (int i = 0; i < count; i++) {
-        printf("Freeing space: deleting %s (%llu bytes)\n",
-               entries[i].name, entries[i].size_bytes);
+        printf("Freeing space: deleting %s (%llu bytes)\n", entries[i].name, entries[i].size_bytes);
         delete_snap_entry(&entries[i]);
-        if (vgfree_percent(vg) >= 7.0) break;
+        if (is_thin && pool[0] != '\0') {
+            double data_pct = 0.0, meta_pct = 0.0;
+            if (get_thinpool_usage(vg, pool, &data_pct, &meta_pct)) {
+                if (data_pct < THIN_POOL_WARN_PERCENT && meta_pct < THIN_POOL_WARN_PERCENT)
+                    break;
+            }
+        } else {
+            if (vgfree_percent(vg) >= VG_WARN_PERCENT)
+                break;
+        }
     }
 }
 
 static void autodel_snapshots(void)
 {
     char *vg = detect_vg();
-    if (vg && vgfree_percent(vg) < 7.0) {
-        printf("VG free space below 7%%, deleting heaviest snapshots...\n");
-        cleanup_by_size(vg);
+    char pool[STR_BUF] = "";
+    bool thin = false;
+    if (vg) {
+        thin = detect_thinpool(vg, pool, sizeof(pool));
+        if (thin && pool[0] != '\0') {
+            double data_pct = 0.0, meta_pct = 0.0;
+            if (get_thinpool_usage(vg, pool, &data_pct, &meta_pct)) {
+                if (data_pct >= THIN_POOL_WARN_PERCENT || meta_pct >= THIN_POOL_WARN_PERCENT) {
+                    printf("Thinpool %s usage high (data: %.1f%%, meta: %.1f%%), deleting heaviest snapshots...\n",
+                           pool, data_pct, meta_pct);
+                    cleanup_by_size(vg, pool, true);
+                    free(vg);
+                    return;
+                }
+            }
+        } else if (vgfree_percent(vg) < VG_WARN_PERCENT) {
+            printf("VG free space below %.0f%%, deleting heaviest snapshots...\n", VG_WARN_PERCENT);
+            cleanup_by_size(vg, pool, false);
+            free(vg);
+            return;
+        }
         free(vg);
-        return;
     }
-    free(vg);
     cleanup_dir(AUTO_DIR);
     cleanup_dir(DAEMON_AUTO_DIR);
     cleanup_dir(MANUAL_DIR);
